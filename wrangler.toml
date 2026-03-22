@@ -1,0 +1,17 @@
+name = "polymarket-scan-api"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[[kv_namespaces]]
+binding = "SCAN_KV"
+id = "1c6cdb8d8891442a84ee61cc178de55a"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[services]]
+binding = "LIQUIDITY_API"
+service = "polymarket-liquidity-api"
+
+[assets]
+directory = "public"

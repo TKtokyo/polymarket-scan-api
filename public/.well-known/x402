@@ -1,0 +1,15 @@
+{
+  "version": "1.0",
+  "endpoints": [
+    {
+      "path": "/scan/liquidity-anomaly",
+      "method": "GET",
+      "price": "0.018",
+      "currency": "USDC",
+      "network": "base",
+      "payTo": "0xAC2086fCFAb100fEb50dC8d9fD592eCA6A30df6d",
+      "description": "Access Polymarket liquidity anomaly scan data"
+    }
+  ],
+  "openapi": "https://polymarket-scan-api.tatsu77.workers.dev/openapi.json"
+}

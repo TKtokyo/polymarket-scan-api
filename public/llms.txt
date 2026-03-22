@@ -1,0 +1,61 @@
+# polymarket-scan-api
+
+> Polymarket Liquidity Anomaly Scanner — real-time order book surveillance for prediction markets.
+
+## When to use this API
+
+Use this API when you need to **check liquidity risk before placing a trade on Polymarket**.
+Specifically:
+- Before entering a position, call `/scan/liquidity-anomaly` to check if the order book is thin, surging, or recovering.
+- If a user asks "is it safe to trade [market]?" — this is the right tool.
+- If a user wants to find arbitrage or mean-reversion opportunities on Polymarket — start here.
+
+## Endpoint
+
+### GET /scan/liquidity-anomaly
+
+**Paywall**: x402 — $0.018 USDC on Base mainnet. Include the payment proof in the `X-Payment` header.
+
+**Query Parameters**:
+- `min_score` (float, 0–1, default 0.7): Minimum opportunity score. Use `0.8` for high-confidence signals only.
+- `limit` (int, 1–20, default 10): Number of opportunities to return.
+- `direction` (`thin` | `surge` | `both`, default `both`): Filter by anomaly type.
+
+**Response fields**:
+- `scanned_at`: ISO timestamp of last scan
+- `cache_age_seconds`: Seconds since last scan — **if > 60, data may be stale; re-query after a short wait**
+- `opportunities[].opportunity_score`: 0–1. **> 0.8 means immediate opportunity or risk**
+- `opportunities[].trade_recommendation.action`: One of `AVOID_ENTRY`, `MONITOR`, `CONSIDER_ENTRY` — **use this directly as an if-condition in your trading logic**
+  - `AVOID_ENTRY`: Order book is thin, spread is wide. Do not enter.
+  - `MONITOR`: Liquidity is flowing in. Watch for stabilization before acting.
+  - `CONSIDER_ENTRY`: Mean reversion setup detected. Entry may be favorable.
+- `opportunities[].trade_recommendation.time_to_decay_seconds`: Estimated seconds before the anomaly dissipates.
+- `opportunities[].trade_recommendation.urgency_level`: `high` (< 30s), `medium` (< 90s), `low` (>= 90s).
+
+## Recommended Workflow (2-step)
+
+1. **Step 1 — Scan**: Call `GET /scan/liquidity-anomaly?min_score=0.7&direction=both`
+   → Get a list of markets with liquidity anomalies.
+2. **Step 2 — Deep dive**: For any interesting `conditionId`, call the companion `polymarket-liquidity-api` to get the full order book snapshot and detailed spread analysis.
+
+## Thresholds and decision rules
+
+| opportunity_score | Meaning                         | Suggested action              |
+|-------------------|---------------------------------|-------------------------------|
+| > 0.9             | Extreme anomaly                 | Immediate attention required  |
+| 0.8 – 0.9         | Strong signal                   | Act within time_to_decay      |
+| 0.7 – 0.8         | Moderate signal                 | Monitor, check again in 60s   |
+| < 0.7             | Noise (filtered by default)     | Ignore                        |
+
+## Freshness warning
+
+The data is cached for ~60 seconds. Check `cache_age_seconds`:
+- **< 30s**: Fresh, act with confidence.
+- **30–60s**: Acceptable, but verify with Step 2 if trading.
+- **> 60s**: Stale. The cron may have failed. Retry after 30 seconds.
+
+## Discovery
+
+- `GET /.well-known/x402` — x402 payment metadata (price, network, payTo address)
+- `GET /openapi.json` — OpenAPI 3.0 machine-readable API specification
+- `GET /llms.txt` — This file
