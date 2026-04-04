@@ -8,6 +8,7 @@ import type { ScanResult, Opportunity } from './types';
 
 export interface Env {
   SCAN_KV: KVNamespace;
+  SCAN_R2: R2Bucket;
   LIQUIDITY_API: Fetcher;
 }
 
@@ -15,12 +16,22 @@ const KV_KEY = 'scan:liquidity-anomaly';
 const KV_TTL = 60; // seconds
 
 // x402 paywall configuration
-const X402_CONFIG = {
+const X402_PAYTO = '0xAC2086fCFAb100fEb50dC8d9fD592eCA6A30df6d';
+
+const X402_SCAN = {
   price: '0.018',
   currency: 'USDC',
   network: 'base',
-  payTo: '0xAC2086fCFAb100fEb50dC8d9fD592eCA6A30df6d',
+  payTo: X402_PAYTO,
   description: 'Access Polymarket liquidity anomaly scan data',
+};
+
+const X402_HISTORY = {
+  price: '0.005',
+  currency: 'USDC',
+  network: 'base',
+  payTo: X402_PAYTO,
+  description: 'Access Polymarket scan history (time-series)',
 };
 
 // ─── Cron Handler ───────────────────────────────────────────────────────────
@@ -101,6 +112,17 @@ async function handleScheduled(env: Env): Promise<void> {
     expirationTtl: KV_TTL,
   });
 
+  // R2: save lightweight snapshot (no prev_depths) for time-series history
+  const r2Key = `scans/${scanResult.scanned_at}.json`;
+  const r2Payload = JSON.stringify({
+    scanned_at: scanResult.scanned_at,
+    total_markets_scanned: scanResult.total_markets_scanned,
+    opportunities: scanResult.opportunities,
+  });
+  await env.SCAN_R2.put(r2Key, r2Payload, {
+    httpMetadata: { contentType: 'application/json' },
+  });
+
   console.log(
     `[cron] Scan complete: ${markets.length} markets, ${opportunities.length} opportunities.`,
   );
@@ -116,11 +138,20 @@ function handleWellKnownX402(): Response {
         {
           path: '/scan/liquidity-anomaly',
           method: 'GET',
-          price: X402_CONFIG.price,
-          currency: X402_CONFIG.currency,
-          network: X402_CONFIG.network,
-          payTo: X402_CONFIG.payTo,
-          description: X402_CONFIG.description,
+          price: X402_SCAN.price,
+          currency: X402_SCAN.currency,
+          network: X402_SCAN.network,
+          payTo: X402_SCAN.payTo,
+          description: X402_SCAN.description,
+        },
+        {
+          path: '/scan/history',
+          method: 'GET',
+          price: X402_HISTORY.price,
+          currency: X402_HISTORY.currency,
+          network: X402_HISTORY.network,
+          payTo: X402_HISTORY.payTo,
+          description: X402_HISTORY.description,
         },
       ],
       openapi: 'https://polymarket-scan-api.tatsu77.workers.dev/openapi.json',
@@ -145,23 +176,7 @@ function verifyX402Payment(request: Request): boolean {
 async function handleScanRequest(request: Request, env: Env): Promise<Response> {
   // x402 paywall check
   if (!verifyX402Payment(request)) {
-    return new Response(
-      JSON.stringify({
-        error: 'Payment Required',
-        price: X402_CONFIG.price,
-        currency: X402_CONFIG.currency,
-        network: X402_CONFIG.network,
-        payTo: X402_CONFIG.payTo,
-        description: X402_CONFIG.description,
-      }),
-      {
-        status: 402,
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Payment-Required': 'true',
-        },
-      },
-    );
+    return make402Response(X402_SCAN);
   }
 
   // Read from KV
@@ -218,6 +233,115 @@ async function handleScanRequest(request: Request, env: Env): Promise<Response> 
   );
 }
 
+function make402Response(config: typeof X402_SCAN | typeof X402_HISTORY): Response {
+  return new Response(
+    JSON.stringify({
+      error: 'Payment Required',
+      price: config.price,
+      currency: config.currency,
+      network: config.network,
+      payTo: config.payTo,
+      description: config.description,
+    }),
+    {
+      status: 402,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Required': 'true',
+      },
+    },
+  );
+}
+
+// R2 snapshot shape (no prev_depths)
+interface R2ScanSnapshot {
+  scanned_at: string;
+  total_markets_scanned: number;
+  opportunities: Opportunity[];
+}
+
+async function handleHistoryRequest(request: Request, env: Env): Promise<Response> {
+  if (!verifyX402Payment(request)) {
+    return make402Response(X402_HISTORY);
+  }
+
+  const url = new URL(request.url);
+  const hours = Math.max(1, Math.min(24, parseInt(url.searchParams.get('hours') ?? '1', 10)));
+  const limit = Math.max(1, Math.min(60, parseInt(url.searchParams.get('limit') ?? '10', 10)));
+  const minScore = Math.max(0, Math.min(1, parseFloat(url.searchParams.get('min_score') ?? '0')));
+
+  const cutoff = new Date(Date.now() - hours * 3600_000).toISOString();
+
+  // List R2 objects with prefix, filtering by cutoff timestamp
+  const scans: Array<{
+    scanned_at: string;
+    total_markets_scanned: number;
+    opportunity_count: number;
+    top_opportunities: Opportunity[];
+  }> = [];
+
+  let cursor: string | undefined;
+  let objectKeys: string[] = [];
+
+  // Collect all keys in the time window (max ~1440 for 24h at 1/min)
+  do {
+    const listed = await env.SCAN_R2.list({
+      prefix: 'scans/',
+      cursor,
+      limit: 1000,
+    });
+
+    for (const obj of listed.objects) {
+      // Key format: scans/{ISO_TIMESTAMP}.json
+      // Extract timestamp for cutoff comparison
+      const ts = obj.key.slice('scans/'.length, -'.json'.length);
+      if (ts >= cutoff) {
+        objectKeys.push(obj.key);
+      }
+    }
+
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
+
+  // Sort descending (newest first) and cap to limit
+  objectKeys.sort().reverse();
+  objectKeys = objectKeys.slice(0, limit);
+
+  // Fetch snapshots from R2 in parallel
+  const fetched = await Promise.all(
+    objectKeys.map(async (key) => {
+      const obj = await env.SCAN_R2.get(key);
+      if (!obj) return null;
+      return obj.json<R2ScanSnapshot>();
+    }),
+  );
+
+  for (const snapshot of fetched) {
+    if (!snapshot) continue;
+
+    let filtered = snapshot.opportunities;
+    if (minScore > 0) {
+      filtered = filtered.filter(o => o.opportunity_score >= minScore);
+    }
+
+    scans.push({
+      scanned_at: snapshot.scanned_at,
+      total_markets_scanned: snapshot.total_markets_scanned,
+      opportunity_count: filtered.length,
+      top_opportunities: filtered,
+    });
+  }
+
+  return new Response(
+    JSON.stringify({
+      period_hours: hours,
+      data_points: scans.length,
+      scans,
+    }),
+    { headers: { 'Content-Type': 'application/json' } },
+  );
+}
+
 // ─── Worker Export ───────────────────────────────────────────────────────────
 
 export default {
@@ -235,9 +359,10 @@ export default {
           version: '1.0.0',
           description:
             'Real-time Polymarket liquidity anomaly scanner via x402 micropayments',
-          endpoint: '/scan/liquidity-anomaly',
-          method: 'GET',
-          price: '$0.018 USDC on Base',
+          endpoints: [
+            { path: '/scan/liquidity-anomaly', price: '$0.018 USDC' },
+            { path: '/scan/history', price: '$0.005 USDC' },
+          ],
           x402: true,
           mcp: {
             endpoint: '/mcp',
@@ -270,6 +395,10 @@ export default {
 
     if (url.pathname === '/scan/liquidity-anomaly' && request.method === 'GET') {
       return handleScanRequest(request, env);
+    }
+
+    if (url.pathname === '/scan/history' && request.method === 'GET') {
+      return handleHistoryRequest(request, env);
     }
 
     return new Response('Not Found', { status: 404 });

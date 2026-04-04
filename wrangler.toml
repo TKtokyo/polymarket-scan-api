@@ -13,5 +13,9 @@ crons = ["* * * * *"]
 binding = "LIQUIDITY_API"
 service = "polymarket-liquidity-api"
 
+[[r2_buckets]]
+binding = "SCAN_R2"
+bucket_name = "polymarket-scan-history"
+
 [assets]
 directory = "public"

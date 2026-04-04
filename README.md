@@ -4,7 +4,7 @@ Real-time liquidity anomaly scanner for **all active Polymarket prediction marke
 
 Every 60 seconds, the scanner inspects every order book on Polymarket, detects thin books / depth surges / mean-reversion setups, and returns **actionable trade recommendations** that AI agents can consume as direct if-conditions in their trading logic.
 
-**x402 paywall** &mdash; $0.018 USDC on Base mainnet per request.
+**x402 paywall** &mdash; micropayments on Base mainnet (USDC).
 
 ---
 
@@ -17,19 +17,30 @@ Cloudflare Cron (every 60 s)
   ├─ 2. Fetch order books in 10-chunks   ← CLOB API
   ├─ 3. Diff against previous depths     ← KV read (prev_depths)
   ├─ 4. Score & classify anomalies
-  └─ 5. Single KV PUT                   → SCAN_KV
-                                           │
-HTTP GET /scan/liquidity-anomaly ──────────┘
-  (x402 paywall → KV read → filter → respond)
+  ├─ 5. Single KV PUT                   → SCAN_KV
+  └─ 6. R2 PUT (lightweight snapshot)   → SCAN_R2
+                                           │  │
+HTTP GET /scan/liquidity-anomaly ──────────┘  │
+  (x402 $0.018 → KV read → filter → respond) │
+                                              │
+HTTP GET /scan/history ───────────────────────┘
+  (x402 $0.005 → R2 list+get → filter → respond)
 ```
 
 The Cron trigger runs the full pipeline and writes the result to **Cloudflare KV** as a single JSON blob. The HTTP endpoint is a pure **KV read** &mdash; no computation at request time, no cold starts, sub-millisecond latency.
 
-**Stack:** Cloudflare Workers + Cron Triggers + KV + Service Bindings
+**Stack:** Cloudflare Workers + Cron Triggers + KV + R2 + Service Bindings
 
 ---
 
-## Endpoint
+## Endpoints
+
+| Endpoint                      | Price            | Description                        |
+|-------------------------------|------------------|------------------------------------|
+| `GET /scan/liquidity-anomaly` | $0.018 USDC/req  | Latest scan snapshot (real-time)   |
+| `GET /scan/history`           | $0.005 USDC/req  | Time-series history (up to 24h)    |
+
+---
 
 ### `GET /scan/liquidity-anomaly`
 
@@ -74,6 +85,71 @@ Requires an `X-Payment` header with a valid x402 payment proof ($0.018 USDC on B
   ]
 }
 ```
+
+---
+
+### `GET /scan/history`
+
+Requires an `X-Payment` header with a valid x402 payment proof ($0.005 USDC on Base).
+
+Returns time-series scan snapshots stored in R2. Each Cron cycle (every 60 s) writes a lightweight snapshot, enabling trend analysis and historical anomaly tracking.
+
+#### Query Parameters
+
+| Parameter   | Type    | Default | Description                                                    |
+|-------------|---------|---------|----------------------------------------------------------------|
+| `hours`     | integer | `1`     | How many hours of history to retrieve (1&ndash;24).            |
+| `limit`     | integer | `10`    | Maximum number of scan snapshots to return (1&ndash;60).       |
+| `min_score` | float   | `0`     | Minimum opportunity score filter (0&ndash;1).                  |
+
+#### Response Example
+
+```json
+{
+  "period_hours": 1,
+  "data_points": 3,
+  "scans": [
+    {
+      "scanned_at": "2025-06-15T12:00:05.123Z",
+      "total_markets_scanned": 342,
+      "opportunity_count": 5,
+      "top_opportunities": [
+        {
+          "conditionId": "0xabc123...",
+          "title": "Will Bitcoin reach $100k by July 2025?",
+          "opportunity_type": "thin_book",
+          "opportunity_score": 0.92,
+          "trade_recommendation": {
+            "action": "AVOID_ENTRY",
+            "confidence": 0.92,
+            "reason": "spread_too_wide",
+            "expected_condition": "spread_widen",
+            "time_to_decay_seconds": 45,
+            "urgency_level": "medium"
+          },
+          "current_spread": 0.0823,
+          "depth_delta_60s": -1250.50,
+          "liquidity_usd": 3200.00,
+          "is_scaling_up": false,
+          "polymarket_url": "https://polymarket.com/event/bitcoin-100k-july"
+        }
+      ]
+    },
+    {
+      "scanned_at": "2025-06-15T11:59:04.456Z",
+      "total_markets_scanned": 342,
+      "opportunity_count": 3,
+      "top_opportunities": []
+    }
+  ]
+}
+```
+
+#### Use Cases
+
+- **Trend detection**: Track how a market's liquidity evolves over the past hour before entering a position.
+- **Backtesting signals**: Compare anomaly scores across multiple scan cycles to validate signal persistence.
+- **Alert correlation**: Cross-reference anomaly timestamps with external events (news, whale trades).
 
 ---
 
@@ -176,6 +252,7 @@ for (const opp of res.data.opportunities) {
 |-------------------|--------------------|-------------------------------------------------|
 | `PAY_TO_ADDRESS`  | `wrangler.toml` or `.dev.vars` | USDC receive address for x402 payments |
 | `SCAN_KV`         | KV namespace binding | Cloudflare KV for scan result storage          |
+| `SCAN_R2`         | R2 bucket binding    | Cloudflare R2 for time-series scan history     |
 | `LIQUIDITY_API`   | Service binding      | Reference to `polymarket-liquidity-api` worker |
 
 ---
