@@ -12,8 +12,17 @@
   "author": "",
   "license": "ISC",
   "description": "",
+  "dependencies": {
+    "@coinbase/x402": "2.1.0",
+    "@x402/core": "2.4.0",
+    "@x402/evm": "2.4.0",
+    "@x402/extensions": "2.4.0",
+    "@x402/hono": "2.4.0",
+    "hono": "^4.12.5"
+  },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260317.1",
+    "@x402/fetch": "2.4.0",
     "typescript": "^5.9.3",
     "wrangler": "^4.76.0"
   }

@@ -1,6 +1,12 @@
 name = "polymarket-scan-api"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Default environment: Base Sepolia (testnet)
+[vars]
+FACILITATOR_URL = "https://www.x402.org/facilitator"
+X402_NETWORK = "eip155:84532"
 
 [[kv_namespaces]]
 binding = "SCAN_KV"
@@ -17,5 +23,32 @@ service = "polymarket-liquidity-api"
 binding = "SCAN_R2"
 bucket_name = "polymarket-scan-history"
 
-[assets]
-directory = "public"
+# --- Production environment: Base mainnet ---
+[env.production]
+name = "polymarket-scan-api"
+
+[env.production.vars]
+FACILITATOR_URL = "https://api.cdp.coinbase.com/platform/v2/x402"
+X402_NETWORK = "eip155:8453"
+
+[[env.production.kv_namespaces]]
+binding = "SCAN_KV"
+id = "1c6cdb8d8891442a84ee61cc178de55a"
+
+[env.production.triggers]
+crons = ["* * * * *"]
+
+[[env.production.services]]
+binding = "LIQUIDITY_API"
+service = "polymarket-liquidity-api"
+
+[[env.production.r2_buckets]]
+binding = "SCAN_R2"
+bucket_name = "polymarket-scan-history"
+
+# Secrets (set via `wrangler secret put`):
+# PAY_TO_ADDRESS = "0xAC2086fCFAb100fEb50dC8d9fD592eCA6A30df6d"
+#
+# Production-only (set via `wrangler secret put --env production`):
+# CDP_API_KEY_ID = "..."
+# CDP_API_KEY_SECRET = "..."

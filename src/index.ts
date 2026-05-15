@@ -1,3 +1,11 @@
+import { Hono } from 'hono';
+import { paymentMiddleware, x402ResourceServer } from '@x402/hono';
+import { HTTPFacilitatorClient } from '@x402/core/server';
+import { registerExactEvmScheme } from '@x402/evm/exact/server';
+import { createFacilitatorConfig } from '@coinbase/x402';
+import type { RoutesConfig } from '@x402/core/server';
+import type { FacilitatorConfig } from '@x402/core/http';
+
 import { fetchAllActiveMarkets } from './pipeline/fetch-markets';
 import { fetchBooksInChunks, type BookData } from './pipeline/fetch-books';
 import { computeDiffs } from './pipeline/diff';
@@ -10,29 +18,18 @@ export interface Env {
   SCAN_KV: KVNamespace;
   SCAN_R2: R2Bucket;
   LIQUIDITY_API: Fetcher;
+  // x402 config
+  FACILITATOR_URL: string;
+  X402_NETWORK: string;
+  PAY_TO_ADDRESS: string;
+  CDP_API_KEY_ID?: string;
+  CDP_API_KEY_SECRET?: string;
+  // Local-dev escape hatch
+  DISABLE_PAYWALL?: string;
 }
 
 const KV_KEY = 'scan:liquidity-anomaly';
 const KV_TTL = 60; // seconds
-
-// x402 paywall configuration
-const X402_PAYTO = '0xAC2086fCFAb100fEb50dC8d9fD592eCA6A30df6d';
-
-const X402_SCAN = {
-  price: '0.018',
-  currency: 'USDC',
-  network: 'base',
-  payTo: X402_PAYTO,
-  description: 'Access Polymarket liquidity anomaly scan data',
-};
-
-const X402_HISTORY = {
-  price: '0.005',
-  currency: 'USDC',
-  network: 'base',
-  payTo: X402_PAYTO,
-  description: 'Access Polymarket scan history (time-series)',
-};
 
 // ─── Cron Handler ───────────────────────────────────────────────────────────
 
@@ -90,16 +87,13 @@ async function handleScheduled(env: Env): Promise<void> {
   // Step 6: Score and generate opportunities
   const opportunities = scoreOpportunities(diffs, books, marketInfoMap);
 
-  // Sort by score descending
   opportunities.sort((a, b) => b.opportunity_score - a.opportunity_score);
 
-  // Build new prev_depths for next run
   const newPrevDepths: Record<string, number> = {};
   for (const book of books) {
     newPrevDepths[book.tokenId] = book.totalDepth;
   }
 
-  // Step 7: Single KV PUT
   const scanResult: ScanResult = {
     scanned_at: new Date().toISOString(),
     last_update_id: Date.now().toString(),
@@ -112,7 +106,6 @@ async function handleScheduled(env: Env): Promise<void> {
     expirationTtl: KV_TTL,
   });
 
-  // R2: save lightweight snapshot (no prev_depths) for time-series history
   const r2Key = `scans/${scanResult.scanned_at}.json`;
   const r2Payload = JSON.stringify({
     scanned_at: scanResult.scanned_at,
@@ -128,151 +121,189 @@ async function handleScheduled(env: Env): Promise<void> {
   );
 }
 
-// ─── HTTP Handler ───────────────────────────────────────────────────────────
+// ─── HTTP App ───────────────────────────────────────────────────────────────
 
-function handleWellKnownX402(): Response {
-  return new Response(
-    JSON.stringify({
-      version: '1.0',
+const app = new Hono<{ Bindings: Env }>();
+
+// Service info (unprotected)
+app.get('/', (c) =>
+  c.json({
+    name: 'Polymarket Scan API',
+    version: '1.0.0',
+    description: 'Real-time Polymarket liquidity anomaly scanner via x402 micropayments',
+    endpoints: [
+      { path: '/scan/liquidity-anomaly', price: '$0.018 USDC' },
+      { path: '/scan/history', price: '$0.005 USDC' },
+    ],
+    x402: true,
+    mcp: {
+      endpoint: '/mcp',
+      transport: 'streamable-http',
+      tools: ['scan_liquidity_anomaly'],
+    },
+  }),
+);
+
+// OpenAPI spec (unprotected)
+app.get('/openapi.json', (c) =>
+  c.json(OPENAPI_SPEC, 200, {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+  }),
+);
+
+// llms.txt (unprotected)
+app.get('/llms.txt', (c) =>
+  c.text(LLMS_TXT, 200, {
+    'Content-Type': 'text/plain; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+  }),
+);
+
+// x402 discovery (unprotected) — discovery metadata only; the canonical 402
+// payload comes from paymentMiddleware on protected routes.
+app.get('/.well-known/x402', (c) =>
+  c.json(
+    {
+      x402Version: 1,
+      resourceServer: 'https://polymarket-scan-api.tatsu77.workers.dev',
+      facilitator: c.env.FACILITATOR_URL,
+      network: c.env.X402_NETWORK,
+      openapi: 'https://polymarket-scan-api.tatsu77.workers.dev/openapi.json',
       endpoints: [
         {
           path: '/scan/liquidity-anomaly',
           method: 'GET',
-          price: X402_SCAN.price,
-          currency: X402_SCAN.currency,
-          network: X402_SCAN.network,
-          payTo: X402_SCAN.payTo,
-          description: X402_SCAN.description,
+          price: '$0.018',
+          asset: 'USDC',
         },
         {
           path: '/scan/history',
           method: 'GET',
-          price: X402_HISTORY.price,
-          currency: X402_HISTORY.currency,
-          network: X402_HISTORY.network,
-          payTo: X402_HISTORY.payTo,
-          description: X402_HISTORY.description,
+          price: '$0.005',
+          asset: 'USDC',
         },
       ],
-      openapi: 'https://polymarket-scan-api.tatsu77.workers.dev/openapi.json',
-    }),
-    {
-      headers: { 'Content-Type': 'application/json' },
     },
-  );
-}
+    200,
+    { 'Access-Control-Allow-Origin': '*' },
+  ),
+);
 
-function verifyX402Payment(request: Request): boolean {
-  // Check for x402 payment proof header
-  const paymentHeader = request.headers.get('X-Payment') || request.headers.get('X-PAYMENT');
-  if (!paymentHeader) return false;
+// MCP server endpoint (discovery-only)
+app.all('/mcp', (c) => handleMcpRequest(c.req.raw));
 
-  // In production, verify the payment proof against the Base network.
-  // For now, accept any non-empty payment header as valid.
-  // TODO: Integrate with x402 payment verification library
-  return paymentHeader.length > 0;
-}
+// ─── x402 paywall middleware ────────────────────────────────────────────────
 
-async function handleScanRequest(request: Request, env: Env): Promise<Response> {
-  // x402 paywall check
-  if (!verifyX402Payment(request)) {
-    return make402Response(X402_SCAN);
+app.use('/scan/*', async (c, next) => {
+  // Local-dev escape hatch
+  if (c.env.DISABLE_PAYWALL === 'true') {
+    return next();
   }
 
-  // Read from KV
+  // Use CDP facilitator config when keys are available (mainnet),
+  // otherwise use simple URL config (testnet).
+  let facilitatorConfig: FacilitatorConfig;
+  if (c.env.CDP_API_KEY_ID && c.env.CDP_API_KEY_SECRET) {
+    facilitatorConfig = createFacilitatorConfig(
+      c.env.CDP_API_KEY_ID,
+      c.env.CDP_API_KEY_SECRET,
+    );
+  } else {
+    facilitatorConfig = { url: c.env.FACILITATOR_URL };
+  }
+  const facilitatorClient = new HTTPFacilitatorClient(facilitatorConfig);
+
+  const server = new x402ResourceServer(facilitatorClient);
+  registerExactEvmScheme(server);
+
+  const network = c.env.X402_NETWORK as `eip155:${string}`;
+  const payTo = c.env.PAY_TO_ADDRESS as `0x${string}`;
+
+  const routes: RoutesConfig = {
+    'GET /scan/liquidity-anomaly': {
+      accepts: {
+        scheme: 'exact',
+        network,
+        price: '$0.018',
+        payTo,
+      },
+      resource: 'Polymarket Liquidity Anomaly Scan',
+      description: 'Real-time scan of all active Polymarket markets for liquidity anomalies',
+      mimeType: 'application/json',
+    },
+    'GET /scan/history': {
+      accepts: {
+        scheme: 'exact',
+        network,
+        price: '$0.005',
+        payTo,
+      },
+      resource: 'Polymarket Liquidity Scan History',
+      description: 'Time-series history of liquidity scan snapshots (up to 24h)',
+      mimeType: 'application/json',
+    },
+  };
+
+  const middleware = paymentMiddleware(routes, server);
+  return middleware(c, next);
+});
+
+// ─── Protected routes ───────────────────────────────────────────────────────
+
+app.get('/scan/liquidity-anomaly', async (c) => {
   let scanResult: ScanResult | null;
   try {
-    scanResult = await env.SCAN_KV.get<ScanResult>(KV_KEY, 'json');
+    scanResult = await c.env.SCAN_KV.get<ScanResult>(KV_KEY, 'json');
   } catch {
-    return new Response(JSON.stringify({ error: 'Service temporarily unavailable' }), {
-      status: 503,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return c.json({ error: 'Service temporarily unavailable' }, 503);
   }
 
   if (!scanResult) {
-    return new Response(JSON.stringify({ error: 'Service temporarily unavailable' }), {
-      status: 503,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return c.json({ error: 'Service temporarily unavailable' }, 503);
   }
 
-  // Parse query parameters
-  const url = new URL(request.url);
+  const url = new URL(c.req.url);
   const minScore = Math.max(0, Math.min(1, parseFloat(url.searchParams.get('min_score') ?? '0.7')));
   const limit = Math.max(1, Math.min(20, parseInt(url.searchParams.get('limit') ?? '10', 10)));
   const direction = url.searchParams.get('direction') ?? 'both';
 
-  // Filter opportunities
-  let filtered = scanResult.opportunities.filter(o => o.opportunity_score >= minScore);
+  let filtered = scanResult.opportunities.filter((o) => o.opportunity_score >= minScore);
 
   if (direction === 'thin') {
-    filtered = filtered.filter(o => o.opportunity_type === 'thin_book');
+    filtered = filtered.filter((o) => o.opportunity_type === 'thin_book');
   } else if (direction === 'surge') {
-    filtered = filtered.filter(o => o.opportunity_type === 'surge');
+    filtered = filtered.filter((o) => o.opportunity_type === 'surge');
   }
-  // 'both' keeps all types
 
   filtered = filtered.slice(0, limit);
 
-  // Compute cache age
   const scannedAt = new Date(scanResult.scanned_at).getTime();
   const cacheAgeSeconds = Math.round((Date.now() - scannedAt) / 1000);
 
-  return new Response(
-    JSON.stringify({
-      scanned_at: scanResult.scanned_at,
-      last_update_id: scanResult.last_update_id,
-      total_markets_scanned: scanResult.total_markets_scanned,
-      cache_age_seconds: cacheAgeSeconds,
-      opportunities: filtered,
-    }),
-    {
-      headers: { 'Content-Type': 'application/json' },
-    },
-  );
-}
+  return c.json({
+    scanned_at: scanResult.scanned_at,
+    last_update_id: scanResult.last_update_id,
+    total_markets_scanned: scanResult.total_markets_scanned,
+    cache_age_seconds: cacheAgeSeconds,
+    opportunities: filtered,
+  });
+});
 
-function make402Response(config: typeof X402_SCAN | typeof X402_HISTORY): Response {
-  return new Response(
-    JSON.stringify({
-      error: 'Payment Required',
-      price: config.price,
-      currency: config.currency,
-      network: config.network,
-      payTo: config.payTo,
-      description: config.description,
-    }),
-    {
-      status: 402,
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Payment-Required': 'true',
-      },
-    },
-  );
-}
-
-// R2 snapshot shape (no prev_depths)
 interface R2ScanSnapshot {
   scanned_at: string;
   total_markets_scanned: number;
   opportunities: Opportunity[];
 }
 
-async function handleHistoryRequest(request: Request, env: Env): Promise<Response> {
-  if (!verifyX402Payment(request)) {
-    return make402Response(X402_HISTORY);
-  }
-
-  const url = new URL(request.url);
+app.get('/scan/history', async (c) => {
+  const url = new URL(c.req.url);
   const hours = Math.max(1, Math.min(24, parseInt(url.searchParams.get('hours') ?? '1', 10)));
   const limit = Math.max(1, Math.min(60, parseInt(url.searchParams.get('limit') ?? '10', 10)));
   const minScore = Math.max(0, Math.min(1, parseFloat(url.searchParams.get('min_score') ?? '0')));
 
   const cutoff = new Date(Date.now() - hours * 3600_000).toISOString();
 
-  // List R2 objects with prefix, filtering by cutoff timestamp
   const scans: Array<{
     scanned_at: string;
     total_markets_scanned: number;
@@ -283,17 +314,14 @@ async function handleHistoryRequest(request: Request, env: Env): Promise<Respons
   let cursor: string | undefined;
   let objectKeys: string[] = [];
 
-  // Collect all keys in the time window (max ~1440 for 24h at 1/min)
   do {
-    const listed = await env.SCAN_R2.list({
+    const listed = await c.env.SCAN_R2.list({
       prefix: 'scans/',
       cursor,
       limit: 1000,
     });
 
     for (const obj of listed.objects) {
-      // Key format: scans/{ISO_TIMESTAMP}.json
-      // Extract timestamp for cutoff comparison
       const ts = obj.key.slice('scans/'.length, -'.json'.length);
       if (ts >= cutoff) {
         objectKeys.push(obj.key);
@@ -303,14 +331,12 @@ async function handleHistoryRequest(request: Request, env: Env): Promise<Respons
     cursor = listed.truncated ? listed.cursor : undefined;
   } while (cursor);
 
-  // Sort descending (newest first) and cap to limit
   objectKeys.sort().reverse();
   objectKeys = objectKeys.slice(0, limit);
 
-  // Fetch snapshots from R2 in parallel
   const fetched = await Promise.all(
     objectKeys.map(async (key) => {
-      const obj = await env.SCAN_R2.get(key);
+      const obj = await c.env.SCAN_R2.get(key);
       if (!obj) return null;
       return obj.json<R2ScanSnapshot>();
     }),
@@ -321,7 +347,7 @@ async function handleHistoryRequest(request: Request, env: Env): Promise<Respons
 
     let filtered = snapshot.opportunities;
     if (minScore > 0) {
-      filtered = filtered.filter(o => o.opportunity_score >= minScore);
+      filtered = filtered.filter((o) => o.opportunity_score >= minScore);
     }
 
     scans.push({
@@ -332,79 +358,18 @@ async function handleHistoryRequest(request: Request, env: Env): Promise<Respons
     });
   }
 
-  return new Response(
-    JSON.stringify({
-      period_hours: hours,
-      data_points: scans.length,
-      scans,
-    }),
-    { headers: { 'Content-Type': 'application/json' } },
-  );
-}
+  return c.json({
+    period_hours: hours,
+    data_points: scans.length,
+    scans,
+  });
+});
 
-// ─── Worker Export ───────────────────────────────────────────────────────────
+// ─── Worker Export ──────────────────────────────────────────────────────────
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-
-    if (url.pathname === '/.well-known/x402') {
-      return handleWellKnownX402();
-    }
-
-    if (url.pathname === '/') {
-      return new Response(
-        JSON.stringify({
-          name: 'Polymarket Scan API',
-          version: '1.0.0',
-          description:
-            'Real-time Polymarket liquidity anomaly scanner via x402 micropayments',
-          endpoints: [
-            { path: '/scan/liquidity-anomaly', price: '$0.018 USDC' },
-            { path: '/scan/history', price: '$0.005 USDC' },
-          ],
-          x402: true,
-          mcp: {
-            endpoint: '/mcp',
-            transport: 'streamable-http',
-            tools: ['scan_liquidity_anomaly'],
-          },
-        }),
-        { headers: { 'Content-Type': 'application/json' } },
-      );
-    }
-
-    if (url.pathname === '/openapi.json') {
-      return new Response(JSON.stringify(OPENAPI_SPEC), {
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-        },
-      });
-    }
-
-    if (url.pathname === '/mcp') {
-      return handleMcpRequest(request);
-    }
-
-    if (url.pathname === '/llms.txt') {
-      return new Response(LLMS_TXT, {
-        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-      });
-    }
-
-    if (url.pathname === '/scan/liquidity-anomaly' && request.method === 'GET') {
-      return handleScanRequest(request, env);
-    }
-
-    if (url.pathname === '/scan/history' && request.method === 'GET') {
-      return handleHistoryRequest(request, env);
-    }
-
-    return new Response('Not Found', { status: 404 });
-  },
-
-  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+  fetch: app.fetch,
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(handleScheduled(env));
   },
 };
