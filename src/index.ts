@@ -3,6 +3,10 @@ import { paymentMiddleware, x402ResourceServer } from '@x402/hono';
 import { HTTPFacilitatorClient } from '@x402/core/server';
 import { registerExactEvmScheme } from '@x402/evm/exact/server';
 import { createFacilitatorConfig } from '@coinbase/x402';
+import {
+  bazaarResourceServerExtension,
+  declareDiscoveryExtension,
+} from '@x402/extensions';
 import type { RoutesConfig } from '@x402/core/server';
 import type { FacilitatorConfig } from '@x402/core/http';
 
@@ -216,6 +220,7 @@ app.use('/scan/*', async (c, next) => {
 
   const server = new x402ResourceServer(facilitatorClient);
   registerExactEvmScheme(server);
+  server.registerExtension(bazaarResourceServerExtension);
 
   const network = c.env.X402_NETWORK as `eip155:${string}`;
   const payTo = c.env.PAY_TO_ADDRESS as `0x${string}`;
@@ -231,6 +236,44 @@ app.use('/scan/*', async (c, next) => {
       resource: 'Polymarket Liquidity Anomaly Scan',
       description: 'Real-time scan of all active Polymarket markets for liquidity anomalies',
       mimeType: 'application/json',
+      extensions: {
+        ...declareDiscoveryExtension({
+          inputSchema: {
+            type: 'object',
+            properties: {
+              min_score: {
+                type: 'number',
+                minimum: 0,
+                maximum: 1,
+                default: 0.7,
+                description: 'Minimum opportunity score (0-1)',
+              },
+              limit: {
+                type: 'integer',
+                minimum: 1,
+                maximum: 20,
+                default: 10,
+                description: 'Maximum number of opportunities to return',
+              },
+              direction: {
+                type: 'string',
+                enum: ['thin', 'surge', 'both'],
+                default: 'both',
+                description: 'Filter by anomaly type',
+              },
+            },
+          },
+          output: {
+            example: {
+              scanned_at: '2026-05-15T12:00:00Z',
+              last_update_id: '1747314000000',
+              total_markets_scanned: 1247,
+              cache_age_seconds: 12,
+              opportunities: [],
+            },
+          },
+        }),
+      },
     },
     'GET /scan/history': {
       accepts: {
@@ -242,6 +285,43 @@ app.use('/scan/*', async (c, next) => {
       resource: 'Polymarket Liquidity Scan History',
       description: 'Time-series history of liquidity scan snapshots (up to 24h)',
       mimeType: 'application/json',
+      extensions: {
+        ...declareDiscoveryExtension({
+          inputSchema: {
+            type: 'object',
+            properties: {
+              hours: {
+                type: 'integer',
+                minimum: 1,
+                maximum: 24,
+                default: 1,
+                description: 'Hours of history to fetch (1-24)',
+              },
+              limit: {
+                type: 'integer',
+                minimum: 1,
+                maximum: 60,
+                default: 10,
+                description: 'Maximum number of snapshots to return',
+              },
+              min_score: {
+                type: 'number',
+                minimum: 0,
+                maximum: 1,
+                default: 0,
+                description: 'Minimum opportunity score filter per snapshot',
+              },
+            },
+          },
+          output: {
+            example: {
+              period_hours: 1,
+              data_points: 10,
+              scans: [],
+            },
+          },
+        }),
+      },
     },
   };
 
