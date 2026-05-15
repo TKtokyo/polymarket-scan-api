@@ -125,6 +125,163 @@ async function handleScheduled(env: Env): Promise<void> {
   );
 }
 
+// ─── Scan route definitions (single source of truth) ───────────────────────
+//
+// SCAN_ROUTES drives both the payment middleware and the .well-known/x402
+// manifest, so the route list, prices, and discovery metadata cannot drift.
+// `buildAccepts` produces the same PaymentRequirements that the @x402/hono
+// middleware emits in the PAYMENT-REQUIRED header, ensuring x402scan and any
+// other consumer sees identical accepts[] from both sources.
+
+interface ScanRouteDef {
+  method: 'GET';
+  price: string; // USD form consumed by paymentMiddleware (e.g. "$0.018")
+  resourceName: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  outputExample: unknown;
+}
+
+const SCAN_ROUTES: Record<string, ScanRouteDef> = {
+  '/scan/liquidity-anomaly': {
+    method: 'GET',
+    price: '$0.018',
+    resourceName: 'Polymarket Liquidity Anomaly Scan',
+    description: 'Real-time scan of all active Polymarket markets for liquidity anomalies',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        min_score: {
+          type: 'number',
+          minimum: 0,
+          maximum: 1,
+          default: 0.7,
+          description: 'Minimum opportunity score (0-1)',
+        },
+        limit: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 20,
+          default: 10,
+          description: 'Maximum number of opportunities to return',
+        },
+        direction: {
+          type: 'string',
+          enum: ['thin', 'surge', 'both'],
+          default: 'both',
+          description: 'Filter by anomaly type',
+        },
+      },
+    },
+    outputExample: {
+      scanned_at: '2026-05-15T12:00:00Z',
+      last_update_id: '1747314000000',
+      total_markets_scanned: 1247,
+      cache_age_seconds: 12,
+      opportunities: [],
+    },
+  },
+  '/scan/history': {
+    method: 'GET',
+    price: '$0.005',
+    resourceName: 'Polymarket Liquidity Scan History',
+    description: 'Time-series history of liquidity scan snapshots (up to 24h)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        hours: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 24,
+          default: 1,
+          description: 'Hours of history to fetch (1-24)',
+        },
+        limit: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 60,
+          default: 10,
+          description: 'Maximum number of snapshots to return',
+        },
+        min_score: {
+          type: 'number',
+          minimum: 0,
+          maximum: 1,
+          default: 0,
+          description: 'Minimum opportunity score filter per snapshot',
+        },
+      },
+    },
+    outputExample: {
+      period_hours: 1,
+      data_points: 10,
+      scans: [],
+    },
+  },
+};
+
+interface UsdcInfo {
+  address: string;
+  name: string;
+  version: string;
+}
+
+// USDC contract metadata per supported network. Values must match what
+// @x402/hono resolves on-chain, so the manifest's accepts[] is byte-identical
+// to the middleware-emitted PAYMENT-REQUIRED payload.
+const USDC_BY_NETWORK: Record<string, UsdcInfo> = {
+  'eip155:8453': {
+    address: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+    name: 'USD Coin',
+    version: '2',
+  },
+  'eip155:84532': {
+    address: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+    name: 'USDC',
+    version: '2',
+  },
+};
+
+// "$0.018" -> "18000" (USDC has 6 decimals). BigInt-based so no float drift.
+function usdToUsdcBaseUnits(price: string): string {
+  const match = /^\$(\d+)(?:\.(\d{1,6}))?$/.exec(price);
+  if (!match) throw new Error(`Invalid price format: ${price}`);
+  const whole = BigInt(match[1]);
+  const frac = (match[2] ?? '').padEnd(6, '0');
+  return (whole * 1_000_000n + BigInt(frac || '0')).toString();
+}
+
+interface PaymentRequirement {
+  scheme: 'exact';
+  network: string;
+  amount: string;
+  asset: string;
+  payTo: string;
+  maxTimeoutSeconds: number;
+  extra: { name: string; version: string };
+}
+
+function buildAccepts(price: string, env: Env): PaymentRequirement[] {
+  const usdc = USDC_BY_NETWORK[env.X402_NETWORK];
+  if (!usdc) {
+    throw new Error(`Unsupported X402_NETWORK: ${env.X402_NETWORK}`);
+  }
+  return [
+    {
+      scheme: 'exact',
+      network: env.X402_NETWORK,
+      amount: usdToUsdcBaseUnits(price),
+      asset: usdc.address,
+      payTo: env.PAY_TO_ADDRESS,
+      maxTimeoutSeconds: 300,
+      extra: { name: usdc.name, version: usdc.version },
+    },
+  ];
+}
+
+// Bumped when the route schema or pricing changes.
+const RESOURCES_LAST_UPDATED = '2026-05-15T00:00:00Z';
+
 // ─── HTTP App ───────────────────────────────────────────────────────────────
 
 const app = new Hono<{ Bindings: Env }>();
@@ -164,35 +321,40 @@ app.get('/llms.txt', (c) =>
   }),
 );
 
-// x402 discovery (unprotected) — discovery metadata only; the canonical 402
-// payload comes from paymentMiddleware on protected routes.
-app.get('/.well-known/x402', (c) =>
-  c.json(
+// x402 discovery (unprotected). Emits the standard `resources` array used by
+// x402scan and other bazaar consumers. Each entry's accepts[] is produced by
+// the same `buildAccepts` helper used by `unpaidResponseBody`, so the manifest
+// and the 402 response stay byte-identical.
+app.get('/.well-known/x402', (c) => {
+  const baseUrl = new URL(c.req.url).origin;
+  const resources = Object.entries(SCAN_ROUTES).map(([path, route]) => ({
+    resource: `${baseUrl}${path}`,
+    type: 'http',
+    x402Version: 2,
+    accepts: buildAccepts(route.price, c.env),
+    lastUpdated: RESOURCES_LAST_UPDATED,
+    metadata: {
+      method: route.method,
+      name: route.resourceName,
+      description: route.description,
+      inputSchema: route.inputSchema,
+      outputExample: route.outputExample,
+    },
+  }));
+
+  return c.json(
     {
       x402Version: 1,
-      resourceServer: 'https://polymarket-scan-api.tatsu77.workers.dev',
+      resourceServer: baseUrl,
       facilitator: c.env.FACILITATOR_URL,
       network: c.env.X402_NETWORK,
-      openapi: 'https://polymarket-scan-api.tatsu77.workers.dev/openapi.json',
-      endpoints: [
-        {
-          path: '/scan/liquidity-anomaly',
-          method: 'GET',
-          price: '$0.018',
-          asset: 'USDC',
-        },
-        {
-          path: '/scan/history',
-          method: 'GET',
-          price: '$0.005',
-          asset: 'USDC',
-        },
-      ],
+      openapi: `${baseUrl}/openapi.json`,
+      resources,
     },
     200,
     { 'Access-Control-Allow-Origin': '*' },
-  ),
-);
+  );
+});
 
 // MCP server endpoint (discovery-only)
 app.all('/mcp', (c) => handleMcpRequest(c.req.raw));
@@ -225,105 +387,38 @@ app.use('/scan/*', async (c, next) => {
   const network = c.env.X402_NETWORK as `eip155:${string}`;
   const payTo = c.env.PAY_TO_ADDRESS as `0x${string}`;
 
-  const routes: RoutesConfig = {
-    'GET /scan/liquidity-anomaly': {
+  const routes: RoutesConfig = {};
+  for (const [path, route] of Object.entries(SCAN_ROUTES)) {
+    const accepts = buildAccepts(route.price, c.env);
+    routes[`${route.method} ${path}`] = {
       accepts: {
         scheme: 'exact',
         network,
-        price: '$0.018',
+        price: route.price,
         payTo,
       },
-      resource: 'Polymarket Liquidity Anomaly Scan',
-      description: 'Real-time scan of all active Polymarket markets for liquidity anomalies',
+      resource: route.resourceName,
+      description: route.description,
       mimeType: 'application/json',
       extensions: {
         ...declareDiscoveryExtension({
-          inputSchema: {
-            type: 'object',
-            properties: {
-              min_score: {
-                type: 'number',
-                minimum: 0,
-                maximum: 1,
-                default: 0.7,
-                description: 'Minimum opportunity score (0-1)',
-              },
-              limit: {
-                type: 'integer',
-                minimum: 1,
-                maximum: 20,
-                default: 10,
-                description: 'Maximum number of opportunities to return',
-              },
-              direction: {
-                type: 'string',
-                enum: ['thin', 'surge', 'both'],
-                default: 'both',
-                description: 'Filter by anomaly type',
-              },
-            },
-          },
-          output: {
-            example: {
-              scanned_at: '2026-05-15T12:00:00Z',
-              last_update_id: '1747314000000',
-              total_markets_scanned: 1247,
-              cache_age_seconds: 12,
-              opportunities: [],
-            },
-          },
+          inputSchema: route.inputSchema,
+          output: { example: route.outputExample },
         }),
       },
-    },
-    'GET /scan/history': {
-      accepts: {
-        scheme: 'exact',
-        network,
-        price: '$0.005',
-        payTo,
-      },
-      resource: 'Polymarket Liquidity Scan History',
-      description: 'Time-series history of liquidity scan snapshots (up to 24h)',
-      mimeType: 'application/json',
-      extensions: {
-        ...declareDiscoveryExtension({
-          inputSchema: {
-            type: 'object',
-            properties: {
-              hours: {
-                type: 'integer',
-                minimum: 1,
-                maximum: 24,
-                default: 1,
-                description: 'Hours of history to fetch (1-24)',
-              },
-              limit: {
-                type: 'integer',
-                minimum: 1,
-                maximum: 60,
-                default: 10,
-                description: 'Maximum number of snapshots to return',
-              },
-              min_score: {
-                type: 'number',
-                minimum: 0,
-                maximum: 1,
-                default: 0,
-                description: 'Minimum opportunity score filter per snapshot',
-              },
-            },
-          },
-          output: {
-            example: {
-              period_hours: 1,
-              data_points: 10,
-              scans: [],
-            },
-          },
-        }),
-      },
-    },
-  };
+      // Mirror accepts[] into the 402 body so callers that only read JSON
+      // (e.g. x402scan validators, naive curl checks) see the same payment
+      // requirements they would otherwise pull from PAYMENT-REQUIRED header.
+      unpaidResponseBody: () => ({
+        contentType: 'application/json',
+        body: {
+          x402Version: 1,
+          accepts,
+          error: 'X-PAYMENT header is required',
+        },
+      }),
+    };
+  }
 
   const middleware = paymentMiddleware(routes, server);
   return middleware(c, next);
