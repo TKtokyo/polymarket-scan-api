@@ -1,38 +1,32 @@
 import { Hono } from 'hono';
-import { paymentMiddleware, x402ResourceServer } from '@x402/hono';
-import { HTTPFacilitatorClient } from '@x402/core/server';
-import { registerExactEvmScheme } from '@x402/evm/exact/server';
-import { createFacilitatorConfig } from '@coinbase/x402';
-import {
-  bazaarResourceServerExtension,
-  declareDiscoveryExtension,
-} from '@x402/extensions';
+import { paymentMiddleware } from '@x402/hono';
+import { declareDiscoveryExtension } from '@x402/extensions/bazaar';
+import { declareSIWxExtension } from '@x402/extensions/sign-in-with-x';
 import type { RoutesConfig } from '@x402/core/server';
-import type { FacilitatorConfig } from '@x402/core/http';
 
 import { fetchAllActiveMarkets } from './pipeline/fetch-markets';
 import { fetchBooksInChunks, type BookData } from './pipeline/fetch-books';
 import { computeDiffs } from './pipeline/diff';
 import { scoreOpportunities } from './pipeline/score';
-import { handleMcpRequest } from './mcp/server';
+import { handleMcpRequest, MCP_TOOLS, buildMcpDiscoveryExtension } from './mcp/server';
 import { OPENAPI_SPEC } from './openapi';
-import type { ScanResult, Opportunity } from './types';
+import { getLatestScan, getHistory, KV_KEY } from './services/scan';
+import {
+  buildAccepts,
+  getResourceServer,
+  envCacheKey,
+  siwxSessionTtlSeconds,
+  SERVICE_NAME,
+  SERVICE_TAGS,
+  PRICE_SCAN,
+  PRICE_HISTORY,
+} from './x402/payments';
+import { VERSION } from './version';
+import type { Env } from './env';
+import type { ScanResult } from './types';
 
-export interface Env {
-  SCAN_KV: KVNamespace;
-  SCAN_R2: R2Bucket;
-  LIQUIDITY_API: Fetcher;
-  // x402 config
-  FACILITATOR_URL: string;
-  X402_NETWORK: string;
-  PAY_TO_ADDRESS: string;
-  CDP_API_KEY_ID?: string;
-  CDP_API_KEY_SECRET?: string;
-  // Local-dev escape hatch
-  DISABLE_PAYWALL?: string;
-}
+export type { Env } from './env';
 
-const KV_KEY = 'scan:liquidity-anomaly';
 const KV_TTL = 60; // seconds
 
 // ─── Cron Handler ───────────────────────────────────────────────────────────
@@ -138,6 +132,7 @@ interface ScanRouteDef {
   price: string; // USD form consumed by paymentMiddleware (e.g. "$0.018")
   resourceName: string;
   description: string;
+  inputExample: Record<string, unknown>;
   inputSchema: Record<string, unknown>;
   outputExample: unknown;
 }
@@ -145,9 +140,11 @@ interface ScanRouteDef {
 const SCAN_ROUTES: Record<string, ScanRouteDef> = {
   '/scan/liquidity-anomaly': {
     method: 'GET',
-    price: '$0.018',
+    price: PRICE_SCAN,
     resourceName: 'Polymarket Liquidity Anomaly Scan',
-    description: 'Real-time scan of all active Polymarket markets for liquidity anomalies',
+    description:
+      'Real-time scan of all active Polymarket markets for liquidity anomalies',
+    inputExample: { min_score: 0.7, limit: 10, direction: 'both' },
     inputSchema: {
       type: 'object',
       properties: {
@@ -174,8 +171,8 @@ const SCAN_ROUTES: Record<string, ScanRouteDef> = {
       },
     },
     outputExample: {
-      scanned_at: '2026-05-15T12:00:00Z',
-      last_update_id: '1747314000000',
+      scanned_at: '2026-07-21T12:00:00Z',
+      last_update_id: '1784980800000',
       total_markets_scanned: 1247,
       cache_age_seconds: 12,
       opportunities: [],
@@ -183,9 +180,10 @@ const SCAN_ROUTES: Record<string, ScanRouteDef> = {
   },
   '/scan/history': {
     method: 'GET',
-    price: '$0.005',
+    price: PRICE_HISTORY,
     resourceName: 'Polymarket Liquidity Scan History',
     description: 'Time-series history of liquidity scan snapshots (up to 24h)',
+    inputExample: { hours: 1, limit: 10 },
     inputSchema: {
       type: 'object',
       properties: {
@@ -220,87 +218,58 @@ const SCAN_ROUTES: Record<string, ScanRouteDef> = {
   },
 };
 
-interface UsdcInfo {
-  address: string;
-  name: string;
-  version: string;
-}
-
-// USDC contract metadata per supported network. Values must match what
-// @x402/hono resolves on-chain, so the manifest's accepts[] is byte-identical
-// to the middleware-emitted PAYMENT-REQUIRED payload.
-const USDC_BY_NETWORK: Record<string, UsdcInfo> = {
-  'eip155:8453': {
-    address: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
-    name: 'USD Coin',
-    version: '2',
-  },
-  'eip155:84532': {
-    address: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
-    name: 'USDC',
-    version: '2',
-  },
-};
-
-// "$0.018" -> "18000" (USDC has 6 decimals). BigInt-based so no float drift.
-function usdToUsdcBaseUnits(price: string): string {
-  const match = /^\$(\d+)(?:\.(\d{1,6}))?$/.exec(price);
-  if (!match) throw new Error(`Invalid price format: ${price}`);
-  const whole = BigInt(match[1]);
-  const frac = (match[2] ?? '').padEnd(6, '0');
-  return (whole * 1_000_000n + BigInt(frac || '0')).toString();
-}
-
-interface PaymentRequirement {
-  scheme: 'exact';
-  network: string;
-  amount: string;
-  asset: string;
-  payTo: string;
-  maxTimeoutSeconds: number;
-  extra: { name: string; version: string };
-}
-
-function buildAccepts(price: string, env: Env): PaymentRequirement[] {
-  const usdc = USDC_BY_NETWORK[env.X402_NETWORK];
-  if (!usdc) {
-    throw new Error(`Unsupported X402_NETWORK: ${env.X402_NETWORK}`);
-  }
-  return [
-    {
-      scheme: 'exact',
-      network: env.X402_NETWORK,
-      amount: usdToUsdcBaseUnits(price),
-      asset: usdc.address,
-      payTo: env.PAY_TO_ADDRESS,
-      maxTimeoutSeconds: 300,
-      extra: { name: usdc.name, version: usdc.version },
-    },
-  ];
-}
-
 // Bumped when the route schema or pricing changes.
-const RESOURCES_LAST_UPDATED = '2026-05-15T00:00:00Z';
+const RESOURCES_LAST_UPDATED = '2026-07-21T00:00:00Z';
+
+// Bazaar discovery extension payload per route, shared verbatim between the
+// payment middleware config and the .well-known/x402 manifest so both
+// surfaces always describe the same schemas.
+function buildDiscoveryExtension(route: ScanRouteDef) {
+  return declareDiscoveryExtension({
+    input: route.inputExample,
+    inputSchema: route.inputSchema,
+    output: { example: route.outputExample },
+  });
+}
 
 // ─── HTTP App ───────────────────────────────────────────────────────────────
 
 const app = new Hono<{ Bindings: Env }>();
 
+// Security headers
+app.use('*', async (c, next) => {
+  await next();
+  c.header('X-Content-Type-Options', 'nosniff');
+  c.header('Cache-Control', 'no-store');
+  c.header('X-Frame-Options', 'DENY');
+});
+
+// Error handler — generic message only, details stay in logs
+app.onError((err, c) => {
+  console.error('Unhandled error:', err.message, err.stack);
+  return c.json(
+    { error: 'internal_error', message: 'An unexpected error occurred.' },
+    500,
+  );
+});
+
 // Service info (unprotected)
 app.get('/', (c) =>
   c.json({
-    name: 'Polymarket Scan API',
-    version: '1.0.0',
+    name: SERVICE_NAME,
+    version: VERSION,
     description: 'Real-time Polymarket liquidity anomaly scanner via x402 micropayments',
     endpoints: [
-      { path: '/scan/liquidity-anomaly', price: '$0.018 USDC' },
-      { path: '/scan/history', price: '$0.005 USDC' },
+      { path: '/scan/liquidity-anomaly', price: `${PRICE_SCAN} USDC` },
+      { path: '/scan/history', price: `${PRICE_HISTORY} USDC` },
     ],
     x402: true,
+    siwx: `Paid wallets can re-read the same resource free for ${siwxSessionTtlSeconds(c.env)}s (one scan cycle) via SIGN-IN-WITH-X`,
     mcp: {
       endpoint: '/mcp',
       transport: 'streamable-http',
-      tools: ['scan_liquidity_anomaly'],
+      tools: MCP_TOOLS.map((t) => t.name),
+      payment: "x402 in-protocol (params._meta['x402/payment'])",
     },
   }),
 );
@@ -327,12 +296,19 @@ app.get('/llms.txt', (c) =>
 // and the 402 response stay byte-identical.
 app.get('/.well-known/x402', (c) => {
   const baseUrl = new URL(c.req.url).origin;
-  const resources = Object.entries(SCAN_ROUTES).map(([path, route]) => ({
+  const httpResources = Object.entries(SCAN_ROUTES).map(([path, route]) => ({
     resource: `${baseUrl}${path}`,
     type: 'http',
     x402Version: 2,
     accepts: buildAccepts(route.price, c.env),
     lastUpdated: RESOURCES_LAST_UPDATED,
+    description: route.description,
+    mimeType: 'application/json',
+    serviceName: SERVICE_NAME,
+    tags: SERVICE_TAGS,
+    // Same bazaar payload the payment middleware declares, so indexers see
+    // identical schemas whether they read the manifest or the 402 response.
+    extensions: buildDiscoveryExtension(route),
     metadata: {
       method: route.method,
       name: route.resourceName,
@@ -342,54 +318,67 @@ app.get('/.well-known/x402', (c) => {
     },
   }));
 
+  // MCP tools are paid resources too: same accepts[], same bazaar payload the
+  // MCP payment wrapper emits in its PaymentRequired responses.
+  const mcpResources = MCP_TOOLS.map((tool) => ({
+    resource: `mcp://tool/${tool.name}`,
+    type: 'mcp',
+    x402Version: 2,
+    accepts: buildAccepts(tool.price, c.env),
+    lastUpdated: RESOURCES_LAST_UPDATED,
+    description: tool.description,
+    mimeType: 'application/json',
+    serviceName: SERVICE_NAME,
+    tags: SERVICE_TAGS,
+    extensions: buildMcpDiscoveryExtension(tool),
+    metadata: {
+      transport: 'streamable-http',
+      endpoint: `${baseUrl}/mcp`,
+      toolName: tool.name,
+      inputSchema: tool.inputSchema,
+    },
+  }));
+
   return c.json(
     {
-      x402Version: 1,
+      x402Version: 2,
       resourceServer: baseUrl,
       facilitator: c.env.FACILITATOR_URL,
       network: c.env.X402_NETWORK,
       openapi: `${baseUrl}/openapi.json`,
-      resources,
+      resources: [...httpResources, ...mcpResources],
     },
     200,
     { 'Access-Control-Allow-Origin': '*' },
   );
 });
 
-// MCP server endpoint (discovery-only)
-app.all('/mcp', (c) => handleMcpRequest(c.req.raw));
+// MCP server endpoint (paid tool execution via @x402/mcp)
+app.all('/mcp', (c) => handleMcpRequest(c.req.raw, c.env));
 
 // ─── x402 paywall middleware ────────────────────────────────────────────────
+//
+// The facilitator client, resource server, and route config are pure
+// functions of env vars, so the middleware is built once per isolate and
+// reused across requests (rebuilt only if env values change).
 
-app.use('/scan/*', async (c, next) => {
-  // Local-dev escape hatch
-  if (c.env.DISABLE_PAYWALL === 'true') {
-    return next();
+let cachedMiddleware: ReturnType<typeof paymentMiddleware> | null = null;
+let cachedMiddlewareKey = '';
+
+function getPaymentMiddleware(env: Env): ReturnType<typeof paymentMiddleware> {
+  const key = envCacheKey(env);
+  if (cachedMiddleware && cachedMiddlewareKey === key) {
+    return cachedMiddleware;
   }
 
-  // Use CDP facilitator config when keys are available (mainnet),
-  // otherwise use simple URL config (testnet).
-  let facilitatorConfig: FacilitatorConfig;
-  if (c.env.CDP_API_KEY_ID && c.env.CDP_API_KEY_SECRET) {
-    facilitatorConfig = createFacilitatorConfig(
-      c.env.CDP_API_KEY_ID,
-      c.env.CDP_API_KEY_SECRET,
-    );
-  } else {
-    facilitatorConfig = { url: c.env.FACILITATOR_URL };
-  }
-  const facilitatorClient = new HTTPFacilitatorClient(facilitatorConfig);
+  const server = getResourceServer(env);
 
-  const server = new x402ResourceServer(facilitatorClient);
-  registerExactEvmScheme(server);
-  server.registerExtension(bazaarResourceServerExtension);
-
-  const network = c.env.X402_NETWORK as `eip155:${string}`;
-  const payTo = c.env.PAY_TO_ADDRESS as `0x${string}`;
+  const network = env.X402_NETWORK as `eip155:${string}`;
+  const payTo = env.PAY_TO_ADDRESS as `0x${string}`;
 
   const routes: RoutesConfig = {};
   for (const [path, route] of Object.entries(SCAN_ROUTES)) {
-    const accepts = buildAccepts(route.price, c.env);
+    const accepts = buildAccepts(route.price, env);
     routes[`${route.method} ${path}`] = {
       accepts: {
         scheme: 'exact',
@@ -397,13 +386,22 @@ app.use('/scan/*', async (c, next) => {
         price: route.price,
         payTo,
       },
-      resource: route.resourceName,
+      // `resource` is intentionally omitted: v2 treats it as the resource
+      // URL and defaults to the request URL. The human-readable name lives
+      // in `serviceName` (Bazaar service metadata).
+      serviceName: SERVICE_NAME,
+      tags: SERVICE_TAGS,
       description: route.description,
       mimeType: 'application/json',
       extensions: {
-        ...declareDiscoveryExtension({
-          inputSchema: route.inputSchema,
-          output: { example: route.outputExample },
+        ...buildDiscoveryExtension(route),
+        // SIWx sessions with a 60s TTL (one scan cycle): a paying wallet can
+        // re-read the SAME snapshot free (retries, different query filters)
+        // but never gets the next scan for free — the data refreshes every
+        // minute, so longer sessions would give fresh scans away.
+        ...declareSIWxExtension({
+          statement:
+            'Sign in to Polymarket Scan API to re-read the scan you already paid for (valid one scan cycle).',
         }),
       },
       // Mirror accepts[] into the 402 body so callers that only read JSON
@@ -412,132 +410,52 @@ app.use('/scan/*', async (c, next) => {
       unpaidResponseBody: () => ({
         contentType: 'application/json',
         body: {
-          x402Version: 1,
+          x402Version: 2,
           accepts,
-          error: 'X-PAYMENT header is required',
+          error:
+            'Payment required: send an x402 payment via the PAYMENT-SIGNATURE header (requirements in the PAYMENT-REQUIRED header and accepts[] above).',
         },
       }),
     };
   }
 
-  const middleware = paymentMiddleware(routes, server);
-  return middleware(c, next);
+  cachedMiddleware = paymentMiddleware(routes, server);
+  cachedMiddlewareKey = key;
+  return cachedMiddleware;
+}
+
+app.use('/scan/*', async (c, next) => {
+  // Local-dev escape hatch
+  if (c.env.DISABLE_PAYWALL === 'true') {
+    return next();
+  }
+  return getPaymentMiddleware(c.env)(c, next);
 });
 
 // ─── Protected routes ───────────────────────────────────────────────────────
 
 app.get('/scan/liquidity-anomaly', async (c) => {
-  let scanResult: ScanResult | null;
-  try {
-    scanResult = await c.env.SCAN_KV.get<ScanResult>(KV_KEY, 'json');
-  } catch {
-    return c.json({ error: 'Service temporarily unavailable' }, 503);
-  }
-
-  if (!scanResult) {
-    return c.json({ error: 'Service temporarily unavailable' }, 503);
-  }
-
   const url = new URL(c.req.url);
-  const minScore = Math.max(0, Math.min(1, parseFloat(url.searchParams.get('min_score') ?? '0.7')));
-  const limit = Math.max(1, Math.min(20, parseInt(url.searchParams.get('limit') ?? '10', 10)));
-  const direction = url.searchParams.get('direction') ?? 'both';
-
-  let filtered = scanResult.opportunities.filter((o) => o.opportunity_score >= minScore);
-
-  if (direction === 'thin') {
-    filtered = filtered.filter((o) => o.opportunity_type === 'thin_book');
-  } else if (direction === 'surge') {
-    filtered = filtered.filter((o) => o.opportunity_type === 'surge');
-  }
-
-  filtered = filtered.slice(0, limit);
-
-  const scannedAt = new Date(scanResult.scanned_at).getTime();
-  const cacheAgeSeconds = Math.round((Date.now() - scannedAt) / 1000);
-
-  return c.json({
-    scanned_at: scanResult.scanned_at,
-    last_update_id: scanResult.last_update_id,
-    total_markets_scanned: scanResult.total_markets_scanned,
-    cache_age_seconds: cacheAgeSeconds,
-    opportunities: filtered,
+  const outcome = await getLatestScan(c.env, {
+    minScore: parseFloat(url.searchParams.get('min_score') ?? ''),
+    limit: parseInt(url.searchParams.get('limit') ?? '', 10),
+    direction: url.searchParams.get('direction') ?? undefined,
   });
-});
 
-interface R2ScanSnapshot {
-  scanned_at: string;
-  total_markets_scanned: number;
-  opportunities: Opportunity[];
-}
+  if (outcome.status === 'unavailable') {
+    return c.json({ error: 'Service temporarily unavailable' }, 503);
+  }
+  return c.json(outcome.body);
+});
 
 app.get('/scan/history', async (c) => {
   const url = new URL(c.req.url);
-  const hours = Math.max(1, Math.min(24, parseInt(url.searchParams.get('hours') ?? '1', 10)));
-  const limit = Math.max(1, Math.min(60, parseInt(url.searchParams.get('limit') ?? '10', 10)));
-  const minScore = Math.max(0, Math.min(1, parseFloat(url.searchParams.get('min_score') ?? '0')));
-
-  const cutoff = new Date(Date.now() - hours * 3600_000).toISOString();
-
-  const scans: Array<{
-    scanned_at: string;
-    total_markets_scanned: number;
-    opportunity_count: number;
-    top_opportunities: Opportunity[];
-  }> = [];
-
-  let cursor: string | undefined;
-  let objectKeys: string[] = [];
-
-  do {
-    const listed = await c.env.SCAN_R2.list({
-      prefix: 'scans/',
-      cursor,
-      limit: 1000,
-    });
-
-    for (const obj of listed.objects) {
-      const ts = obj.key.slice('scans/'.length, -'.json'.length);
-      if (ts >= cutoff) {
-        objectKeys.push(obj.key);
-      }
-    }
-
-    cursor = listed.truncated ? listed.cursor : undefined;
-  } while (cursor);
-
-  objectKeys.sort().reverse();
-  objectKeys = objectKeys.slice(0, limit);
-
-  const fetched = await Promise.all(
-    objectKeys.map(async (key) => {
-      const obj = await c.env.SCAN_R2.get(key);
-      if (!obj) return null;
-      return obj.json<R2ScanSnapshot>();
-    }),
-  );
-
-  for (const snapshot of fetched) {
-    if (!snapshot) continue;
-
-    let filtered = snapshot.opportunities;
-    if (minScore > 0) {
-      filtered = filtered.filter((o) => o.opportunity_score >= minScore);
-    }
-
-    scans.push({
-      scanned_at: snapshot.scanned_at,
-      total_markets_scanned: snapshot.total_markets_scanned,
-      opportunity_count: filtered.length,
-      top_opportunities: filtered,
-    });
-  }
-
-  return c.json({
-    period_hours: hours,
-    data_points: scans.length,
-    scans,
+  const body = await getHistory(c.env, {
+    hours: parseInt(url.searchParams.get('hours') ?? '', 10),
+    limit: parseInt(url.searchParams.get('limit') ?? '', 10),
+    minScore: parseFloat(url.searchParams.get('min_score') ?? ''),
   });
+  return c.json(body);
 });
 
 // ─── Worker Export ──────────────────────────────────────────────────────────
@@ -563,11 +481,11 @@ Specifically:
 - If a user asks "is it safe to trade [market]?" — this is the right tool.
 - If a user wants to find arbitrage or mean-reversion opportunities on Polymarket — start here.
 
-## Endpoint
+## Endpoints
 
 ### GET /scan/liquidity-anomaly
 
-**Paywall**: x402 — $0.018 USDC on Base mainnet. Include the payment proof in the \`X-Payment\` header.
+**Paywall**: x402 v2 — ${PRICE_SCAN} USDC on Base mainnet. Send the signed payment in the \`PAYMENT-SIGNATURE\` header (requirements come from the 402 response's \`PAYMENT-REQUIRED\` header). A wallet that paid can re-read the same resource free for ~60s (one scan cycle) via the \`SIGN-IN-WITH-X\` header.
 
 **Query Parameters**:
 - \`min_score\` (float, 0–1, default 0.7): Minimum opportunity score. Use \`0.8\` for high-confidence signals only.
@@ -584,6 +502,17 @@ Specifically:
   - \`CONSIDER_ENTRY\`: Mean reversion setup detected. Entry may be favorable.
 - \`opportunities[].trade_recommendation.time_to_decay_seconds\`: Estimated seconds before the anomaly dissipates.
 - \`opportunities[].trade_recommendation.urgency_level\`: \`high\` (< 30s), \`medium\` (< 90s), \`low\` (>= 90s).
+
+### GET /scan/history
+
+**Paywall**: x402 v2 — ${PRICE_HISTORY} USDC on Base mainnet.
+
+Time-series history of scan snapshots (up to 24h, one per minute). Query params: \`hours\` (1–24), \`limit\` (1–60), \`min_score\` (0–1).
+
+## MCP
+
+- Streamable HTTP endpoint: /mcp
+- Paid tools with in-protocol x402 payment: scan_liquidity_anomaly (${PRICE_SCAN}), scan_history (${PRICE_HISTORY}). x402-aware MCP clients (@x402/mcp) pay automatically via params._meta["x402/payment"].
 
 ## Recommended Workflow (2-step)
 
@@ -609,7 +538,7 @@ The data is cached for ~60 seconds. Check \`cache_age_seconds\`:
 
 ## Discovery
 
-- \`GET /.well-known/x402\` — x402 payment metadata (price, network, payTo address)
+- \`GET /.well-known/x402\` — x402 payment metadata (price, network, payTo address; includes MCP tool resources)
 - \`GET /openapi.json\` — OpenAPI 3.0 machine-readable API specification
 - \`GET /llms.txt\` — This file
 `;

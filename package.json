@@ -1,6 +1,6 @@
 {
   "name": "polymarket-scan-api",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "main": "src/index.ts",
   "scripts": {
     "dev": "wrangler dev",
@@ -14,16 +14,20 @@
   "description": "",
   "dependencies": {
     "@coinbase/x402": "2.1.0",
-    "@x402/core": "2.4.0",
-    "@x402/evm": "2.4.0",
-    "@x402/extensions": "2.4.0",
-    "@x402/hono": "2.4.0",
+    "@x402/core": "2.19.0",
+    "@x402/evm": "2.19.0",
+    "@x402/extensions": "2.19.0",
+    "@x402/hono": "2.19.0",
+    "@x402/mcp": "2.19.0",
     "hono": "^4.12.5"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260317.1",
-    "@x402/fetch": "2.4.0",
+    "@x402/fetch": "2.19.0",
     "typescript": "^5.9.3",
     "wrangler": "^4.76.0"
+  },
+  "allowScripts": {
+    "workerd@1.20260317.1": true
   }
 }

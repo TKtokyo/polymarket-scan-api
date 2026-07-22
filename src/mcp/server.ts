@@ -1,16 +1,40 @@
 /**
- * Lightweight stateless MCP server implementation (discovery-only).
+ * Lightweight stateless MCP server with x402 paid tool execution.
  *
- * Implements the MCP Streamable HTTP transport (JSON-RPC 2.0) directly.
+ * Implements the MCP Streamable HTTP transport (JSON-RPC 2.0) directly,
+ * without the heavy @modelcontextprotocol/sdk or agents package.
  *
  * Supported methods:
- *   - initialize              → server capabilities & info
+ *   - initialize                → server capabilities & info
  *   - notifications/initialized → acknowledge (no response)
- *   - tools/list              → available tool definitions (free)
- *   - tools/call              → returns payment-required redirect (no data)
+ *   - tools/list                → available tool definitions (free)
+ *   - tools/call                → paid execution via @x402/mcp payment wrapper
  *
- * Actual data retrieval requires x402 payment via the REST API.
+ * Payment flow (x402 MCP transport):
+ *   1. Client calls a tool without payment → tool result carries a
+ *      PaymentRequired object (isError: true, structuredContent + JSON text).
+ *   2. Client signs payment and retries with the payload in
+ *      params._meta["x402/payment"].
+ *   3. Server verifies via facilitator, runs the tool, settles, and attaches
+ *      the settlement receipt to result._meta["x402/payment-response"].
+ *
+ * x402-aware clients (@x402/mcp x402MCPClient) handle this automatically.
  */
+
+import { createPaymentWrapper } from "@x402/mcp";
+import type { MCPToolCallback, WrappedToolResult, ToolResult } from "@x402/mcp";
+import { declareDiscoveryExtension } from "@x402/extensions/bazaar";
+import type { Env } from "../env";
+import { getLatestScan, getHistory } from "../services/scan";
+import {
+  getResourceServer,
+  buildAccepts,
+  SERVICE_NAME,
+  SERVICE_TAGS,
+  PRICE_SCAN,
+  PRICE_HISTORY,
+} from "../x402/payments";
+import { VERSION } from "../version";
 
 // ─── JSON-RPC types ──────────────────────────────────────────────
 
@@ -30,19 +54,28 @@ interface JsonRpcResponse {
 
 // ─── MCP protocol constants ──────────────────────────────────────
 
-const PROTOCOL_VERSION = "2025-03-26";
+const PROTOCOL_VERSION = "2025-06-18";
 const SERVER_INFO = {
-  name: "Polymarket Scan API",
-  version: "1.0.0",
+  name: SERVICE_NAME,
+  version: VERSION,
 };
 
 // ─── Tool definitions ───────────────────────────────────────────
 
-const TOOLS = [
+export interface McpToolDef {
+  name: string;
+  description: string;
+  price: string;
+  inputSchema: Record<string, unknown>;
+  outputExample: unknown;
+}
+
+export const MCP_TOOLS: McpToolDef[] = [
   {
     name: "scan_liquidity_anomaly",
     description:
-      "Scan all active Polymarket prediction markets for liquidity anomalies — thin books, depth surges, and mean-reversion setups. Returns scored opportunities with trade recommendations (AVOID_ENTRY / MONITOR / CONSIDER_ENTRY) and urgency levels. Requires x402 payment ($0.018 USDC) via REST API.",
+      `Scan all active Polymarket prediction markets for liquidity anomalies — thin books, depth surges, and mean-reversion setups. Returns scored opportunities with trade recommendations (AVOID_ENTRY / MONITOR / CONSIDER_ENTRY) and urgency levels. Paid tool: ${PRICE_SCAN} USDC per call via x402 (payment handled in-protocol; x402-aware MCP clients pay automatically). A paying wallet can re-call free for 60s (one scan cycle) via SIWx.`,
+    price: PRICE_SCAN,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -55,8 +88,7 @@ const TOOLS = [
         },
         limit: {
           type: "integer",
-          description:
-            "Number of opportunities to return (1–20, default 10).",
+          description: "Number of opportunities to return (1–20, default 10).",
           minimum: 1,
           maximum: 20,
         },
@@ -69,14 +101,176 @@ const TOOLS = [
       },
       required: [],
     },
+    outputExample: {
+      scanned_at: "2026-07-21T12:00:00Z",
+      total_markets_scanned: 1247,
+      cache_age_seconds: 12,
+      opportunities: [],
+    },
+  },
+  {
+    name: "scan_history",
+    description:
+      `Time-series history of Polymarket liquidity scan snapshots (up to 24h, one snapshot per minute). Useful for spotting liquidity trends and verifying how long an anomaly has persisted. Paid tool: ${PRICE_HISTORY} USDC per call via x402 (payment handled in-protocol; x402-aware MCP clients pay automatically).`,
+    price: PRICE_HISTORY,
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        hours: {
+          type: "integer",
+          description: "Hours of history to fetch (1–24, default 1).",
+          minimum: 1,
+          maximum: 24,
+        },
+        limit: {
+          type: "integer",
+          description: "Maximum number of snapshots to return (1–60, default 10).",
+          minimum: 1,
+          maximum: 60,
+        },
+        min_score: {
+          type: "number",
+          description: "Minimum opportunity score filter per snapshot (0–1, default 0).",
+          minimum: 0,
+          maximum: 1,
+        },
+      },
+      required: [],
+    },
+    outputExample: {
+      period_hours: 1,
+      data_points: 10,
+      scans: [],
+    },
   },
 ];
 
+/**
+ * Bazaar discovery extension payload for an MCP tool. Used both in the
+ * PaymentRequired responses emitted by the payment wrapper and in the
+ * .well-known/x402 manifest, so indexers see identical metadata.
+ */
+export function buildMcpDiscoveryExtension(
+  tool: McpToolDef,
+): Record<string, unknown> {
+  return declareDiscoveryExtension({
+    toolName: tool.name,
+    description: tool.description,
+    transport: "streamable-http",
+    inputSchema: tool.inputSchema,
+    output: { example: tool.outputExample },
+  });
+}
+
+// ─── Tool handlers (business logic, payment-agnostic) ────────────
+
+function textResult(payload: unknown, isError = false): ToolResult {
+  return {
+    content: [{ type: "text", text: JSON.stringify(payload) }],
+    structuredContent: payload as Record<string, unknown>,
+    isError,
+  };
+}
+
+function makeScanHandler(env: Env) {
+  return async (args: Record<string, unknown>): Promise<ToolResult> => {
+    const direction = args.direction;
+    if (
+      direction !== undefined &&
+      !["thin", "surge", "both"].includes(String(direction))
+    ) {
+      return textResult(
+        {
+          error: "invalid_direction",
+          message: "direction must be 'thin', 'surge', or 'both'.",
+        },
+        true,
+      );
+    }
+
+    const outcome = await getLatestScan(env, {
+      minScore: args.min_score === undefined ? undefined : Number(args.min_score),
+      limit: args.limit === undefined ? undefined : Number(args.limit),
+      direction: direction === undefined ? undefined : String(direction),
+    });
+
+    if (outcome.status === "unavailable") {
+      return textResult(
+        {
+          error: "service_unavailable",
+          message: "Scan data temporarily unavailable. Retry in 60 seconds.",
+        },
+        true,
+      );
+    }
+    return textResult(outcome.body);
+  };
+}
+
+function makeHistoryHandler(env: Env) {
+  return async (args: Record<string, unknown>): Promise<ToolResult> => {
+    const body = await getHistory(env, {
+      hours: args.hours === undefined ? undefined : Number(args.hours),
+      limit: args.limit === undefined ? undefined : Number(args.limit),
+      minScore: args.min_score === undefined ? undefined : Number(args.min_score),
+    });
+    return textResult(body);
+  };
+}
+
+// ─── Paid tool dispatch ──────────────────────────────────────────
+
+/**
+ * Build the payment-wrapped tool callbacks for this request.
+ *
+ * The resource server is memoized per isolate (getResourceServer); the
+ * wrappers themselves are cheap closures created per request so they can
+ * capture env.
+ */
+function buildToolCallbacks(env: Env): Record<string, MCPToolCallback> {
+  const handlers: Record<
+    string,
+    (args: Record<string, unknown>) => Promise<ToolResult>
+  > = {
+    scan_liquidity_anomaly: makeScanHandler(env),
+    scan_history: makeHistoryHandler(env),
+  };
+
+  // Local dev: skip payment entirely when DISABLE_PAYWALL is set.
+  if (env.DISABLE_PAYWALL === "true") {
+    const passthrough: Record<string, MCPToolCallback> = {};
+    for (const [name, handler] of Object.entries(handlers)) {
+      passthrough[name] = async (callArgs) =>
+        (await handler(callArgs)) as WrappedToolResult;
+    }
+    return passthrough;
+  }
+
+  const server = getResourceServer(env);
+  const callbacks: Record<string, MCPToolCallback> = {};
+  for (const tool of MCP_TOOLS) {
+    const paid = createPaymentWrapper(server, {
+      accepts: buildAccepts(tool.price, env) as never,
+      resource: {
+        url: `mcp://tool/${tool.name}`,
+        description: tool.description,
+        mimeType: "application/json",
+        serviceName: SERVICE_NAME,
+        tags: SERVICE_TAGS,
+      },
+      extensions: buildMcpDiscoveryExtension(tool),
+    });
+    callbacks[tool.name] = paid(handlers[tool.name]);
+  }
+  return callbacks;
+}
+
 // ─── JSON-RPC method dispatcher ──────────────────────────────────
 
-function handleJsonRpcRequest(
+async function handleJsonRpcRequest(
   req: JsonRpcRequest,
-): JsonRpcResponse | null {
+  env: Env,
+): Promise<JsonRpcResponse | null> {
   const { method, id, params } = req;
 
   // Notifications have no id and expect no response
@@ -102,37 +296,47 @@ function handleJsonRpcRequest(
       return {
         jsonrpc: "2.0",
         id,
-        result: { tools: TOOLS },
+        result: {
+          tools: MCP_TOOLS.map((t) => ({
+            name: t.name,
+            description: t.description,
+            inputSchema: t.inputSchema,
+          })),
+        },
       };
 
     case "tools/call": {
-      const toolName = (params as { name?: string })?.name;
-
-      if (toolName !== "scan_liquidity_anomaly") {
+      const p = (params ?? {}) as {
+        name?: string;
+        arguments?: Record<string, unknown>;
+        _meta?: Record<string, unknown>;
+      };
+      const toolName = p.name;
+      if (!toolName || !MCP_TOOLS.some((t) => t.name === toolName)) {
         return {
           jsonrpc: "2.0",
           id,
-          error: {
-            code: -32602,
-            message: "Unknown tool.",
-          },
+          error: { code: -32602, message: "Unknown tool." },
         };
       }
 
-      // Discovery-only: do NOT execute the tool, return payment redirect
-      return {
-        jsonrpc: "2.0",
-        id,
-        result: {
-          content: [
-            {
-              type: "text",
-              text: "Payment required. Please use the REST API endpoint with x402 payment: GET /scan/liquidity-anomaly — $0.018 USDC on Base.",
-            },
-          ],
-          isError: false,
-        },
-      };
+      const callbacks = buildToolCallbacks(env);
+      try {
+        const result = await callbacks[toolName](p.arguments ?? {}, {
+          _meta: p._meta,
+        });
+        return { jsonrpc: "2.0", id, result };
+      } catch (err) {
+        console.error(
+          `MCP tools/call ${toolName} failed:`,
+          err instanceof Error ? err.message : err,
+        );
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32603, message: "Tool execution failed." },
+        };
+      }
     }
 
     default:
@@ -173,10 +377,11 @@ function withCors(response: Response): Response {
 
 /**
  * Handle an MCP Streamable HTTP request.
- * Discovery-only: initialize + tools/list are free, tools/call returns payment redirect.
+ * initialize + tools/list are free; tools/call executes with x402 payment.
  */
 export async function handleMcpRequest(
   request: Request,
+  env: Env,
 ): Promise<Response> {
   // CORS preflight
   if (request.method === "OPTIONS") {
@@ -259,7 +464,7 @@ export async function handleMcpRequest(
   if (Array.isArray(body)) {
     const responses: JsonRpcResponse[] = [];
     for (const req of body as JsonRpcRequest[]) {
-      const resp = handleJsonRpcRequest(req);
+      const resp = await handleJsonRpcRequest(req, env);
       if (resp) responses.push(resp);
     }
     if (responses.length === 0) {
@@ -273,7 +478,7 @@ export async function handleMcpRequest(
   }
 
   // Single request
-  const resp = handleJsonRpcRequest(body as JsonRpcRequest);
+  const resp = await handleJsonRpcRequest(body as JsonRpcRequest, env);
   if (!resp) {
     return withCors(new Response(null, { status: 204 }));
   }
