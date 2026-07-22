@@ -44,7 +44,7 @@ The Cron trigger runs the full pipeline and writes the result to **Cloudflare KV
 
 ### `GET /scan/liquidity-anomaly`
 
-Requires an `X-Payment` header with a valid x402 payment proof ($0.018 USDC on Base).
+Requires an x402 v2 payment: sign the requirements from the 402 response’s `PAYMENT-REQUIRED` header and retry with the `PAYMENT-SIGNATURE` header ($0.018 USDC on Base). Wallets that paid can re-read the same scan snapshot free until the next scan (max ~60s) via `SIGN-IN-WITH-X`.
 
 #### Query Parameters
 
@@ -90,7 +90,7 @@ Requires an `X-Payment` header with a valid x402 payment proof ($0.018 USDC on B
 
 ### `GET /scan/history`
 
-Requires an `X-Payment` header with a valid x402 payment proof ($0.005 USDC on Base).
+Requires an x402 v2 payment: sign the requirements from the 402 response’s `PAYMENT-REQUIRED` header and retry with the `PAYMENT-SIGNATURE` header ($0.005 USDC on Base).
 
 Returns time-series scan snapshots stored in R2. Each Cron cycle (every 60 s) writes a lightweight snapshot, enabling trend analysis and historical anomaly tracking.
 

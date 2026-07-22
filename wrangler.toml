@@ -1,12 +1,14 @@
 name = "polymarket-scan-api"
 main = "src/index.ts"
-compatibility_date = "2024-12-01"
+compatibility_date = "2026-07-01"
 compatibility_flags = ["nodejs_compat"]
 
 # Default environment: Base Sepolia (testnet)
 [vars]
 FACILITATOR_URL = "https://www.x402.org/facilitator"
 X402_NETWORK = "eip155:84532"
+PUBLIC_ORIGIN = "https://polymarket-scan-api.tatsu77.workers.dev"
+# SIWX_SESSION_TTL_SECONDS = "60"  # optional; default 60 (one scan cycle)
 
 [[kv_namespaces]]
 binding = "SCAN_KV"
@@ -30,6 +32,7 @@ name = "polymarket-scan-api"
 [env.production.vars]
 FACILITATOR_URL = "https://api.cdp.coinbase.com/platform/v2/x402"
 X402_NETWORK = "eip155:8453"
+PUBLIC_ORIGIN = "https://polymarket-scan-api.tatsu77.workers.dev"
 
 [[env.production.kv_namespaces]]
 binding = "SCAN_KV"
