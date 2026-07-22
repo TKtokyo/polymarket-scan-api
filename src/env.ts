@@ -11,8 +11,11 @@ export interface Env {
   // Public browser-visible origin, used for SIWx domain/URI binding.
   // Falls back to http://localhost:8787 for local dev.
   PUBLIC_ORIGIN?: string;
-  // SIWx session length in seconds (default 60 = one scan cycle): how long a
-  // wallet that paid for a resource can re-read it without paying again.
+  // SIWx session HARD CAP in seconds (default 60). Sessions are bound to the
+  // scan snapshot that was live at payment time and end as soon as the cron
+  // writes a new snapshot (max ~60s), whichever comes first. Values below 60
+  // are honored via a paidAt timestamp check even though KV's minimum TTL is
+  // 60s.
   SIWX_SESSION_TTL_SECONDS?: string;
   // Local-dev escape hatch
   DISABLE_PAYWALL?: string;

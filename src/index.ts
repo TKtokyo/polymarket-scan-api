@@ -264,7 +264,7 @@ app.get('/', (c) =>
       { path: '/scan/history', price: `${PRICE_HISTORY} USDC` },
     ],
     x402: true,
-    siwx: `Paid wallets can re-read the same resource free for ${siwxSessionTtlSeconds(c.env)}s (one scan cycle) via SIGN-IN-WITH-X`,
+    siwx: `Paid wallets can re-read the same scan snapshot free until the next scan (max ${siwxSessionTtlSeconds(c.env)}s) via SIGN-IN-WITH-X`,
     mcp: {
       endpoint: '/mcp',
       transport: 'streamable-http',
@@ -395,13 +395,13 @@ function getPaymentMiddleware(env: Env): ReturnType<typeof paymentMiddleware> {
       mimeType: 'application/json',
       extensions: {
         ...buildDiscoveryExtension(route),
-        // SIWx sessions with a 60s TTL (one scan cycle): a paying wallet can
-        // re-read the SAME snapshot free (retries, different query filters)
-        // but never gets the next scan for free — the data refreshes every
-        // minute, so longer sessions would give fresh scans away.
+        // SIWx sessions bound to the scan snapshot (see KVSIWxStorage): a
+        // paying wallet can re-read the SAME snapshot free (retries,
+        // different query filters) but the session ends the moment the cron
+        // writes a new snapshot — the next scan is never free.
         ...declareSIWxExtension({
           statement:
-            'Sign in to Polymarket Scan API to re-read the scan you already paid for (valid one scan cycle).',
+            'Sign in to Polymarket Scan API to re-read the scan snapshot you already paid for (valid until the next scan).',
         }),
       },
       // Mirror accepts[] into the 402 body so callers that only read JSON
@@ -485,7 +485,7 @@ Specifically:
 
 ### GET /scan/liquidity-anomaly
 
-**Paywall**: x402 v2 — ${PRICE_SCAN} USDC on Base mainnet. Send the signed payment in the \`PAYMENT-SIGNATURE\` header (requirements come from the 402 response's \`PAYMENT-REQUIRED\` header). A wallet that paid can re-read the same resource free for ~60s (one scan cycle) via the \`SIGN-IN-WITH-X\` header.
+**Paywall**: x402 v2 — ${PRICE_SCAN} USDC on Base mainnet. Send the signed payment in the \`PAYMENT-SIGNATURE\` header (requirements come from the 402 response's \`PAYMENT-REQUIRED\` header). A wallet that paid can re-read the same scan snapshot free until the next scan (max ~60s) via the \`SIGN-IN-WITH-X\` header — retries and filter changes are free, fresh scans are not.
 
 **Query Parameters**:
 - \`min_score\` (float, 0–1, default 0.7): Minimum opportunity score. Use \`0.8\` for high-confidence signals only.

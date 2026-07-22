@@ -74,7 +74,7 @@ export const MCP_TOOLS: McpToolDef[] = [
   {
     name: "scan_liquidity_anomaly",
     description:
-      `Scan all active Polymarket prediction markets for liquidity anomalies — thin books, depth surges, and mean-reversion setups. Returns scored opportunities with trade recommendations (AVOID_ENTRY / MONITOR / CONSIDER_ENTRY) and urgency levels. Paid tool: ${PRICE_SCAN} USDC per call via x402 (payment handled in-protocol; x402-aware MCP clients pay automatically). A paying wallet can re-call free for 60s (one scan cycle) via SIWx.`,
+      `Scan all active Polymarket prediction markets for liquidity anomalies — thin books, depth surges, and mean-reversion setups. Returns scored opportunities with trade recommendations (AVOID_ENTRY / MONITOR / CONSIDER_ENTRY) and urgency levels. Paid tool: ${PRICE_SCAN} USDC per call via x402 (payment handled in-protocol; x402-aware MCP clients pay automatically).`,
     price: PRICE_SCAN,
     inputSchema: {
       type: "object" as const,

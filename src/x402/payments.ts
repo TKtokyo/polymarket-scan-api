@@ -109,10 +109,10 @@ export function envCacheKey(env: Env): string {
 }
 
 /**
- * SIWx session length. Default 60s = one scan cycle: the data refreshes
- * every minute, so a session only makes re-reads of the SAME snapshot free
- * (retries, different query filters). Longer TTLs would give away fresh
- * scans and are deliberately not the default for this service.
+ * SIWx session hard cap. The real session boundary is snapshot identity
+ * (see KVSIWxStorage): free re-reads end the moment the cron writes a new
+ * snapshot, so a session never yields a scan the wallet didn't pay for.
+ * This cap (default 60s) only bounds the window further.
  */
 export function siwxSessionTtlSeconds(env: Env): number {
   const parsed = parseInt(env.SIWX_SESSION_TTL_SECONDS ?? "", 10);
